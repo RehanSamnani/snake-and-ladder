@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Game Dashboard</title>
+    <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+    <div class="dashboard-container">
+        <h1>Coding Snake & Ladder - Game Dashboard</h1>
+        <div class="game-status">
+            <h2>Current Game Status</h2>
+            <div id="current-turn-info"></div>
+            <div id="players-overview"></div>
+        </div>
+        <div class="game-board-overview">
+            <div id="master-board"></div>
+        </div>
+        <div class="game-log">
+            <h3>Game Log</h3>
+            <div id="game-events"></div>
+        </div>
+    </div>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/js/dashboard.js"></script>
+</body>
+</html> 
