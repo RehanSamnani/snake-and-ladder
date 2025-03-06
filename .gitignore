@@ -21,4 +21,7 @@ build/
 
 # OS files
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Test coverage
+coverage/ 

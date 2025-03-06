@@ -9,22 +9,15 @@ const questions = require('./src/questions');
 
 // Middleware
 app.use(cors());
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/socket.io', express.static(path.join(__dirname, 'node_modules/socket.io/client-dist')));
 
 // Initialize game state
 const gameState = new GameState();
 
 // Routes
 app.get('/', (req, res) => {
-    res.redirect('/player');
-});
-
-app.get('/player', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'player.html'));
-});
-
-app.get('/dashboard', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
 });
 
 // Socket.IO connection handling
@@ -33,130 +26,193 @@ io.on('connection', (socket) => {
 
     // Handle player joining
     socket.on('join-game', (playerName) => {
-        if (Object.keys(gameState.players).length >= 4) {
-            socket.emit('game-full');
+        if (!playerName || typeof playerName !== 'string') {
+            socket.emit('error', { message: 'Invalid player name' });
             return;
         }
 
-        gameState.players[socket.id] = {
-            id: socket.id,
-            name: playerName,
-            position: 1,
-            color: getNextColor(Object.keys(gameState.players).length),
-            isActive: false
-        };
-
-        // Start game if we have 2-4 players
-        if (Object.keys(gameState.players).length >= 2 && !gameState.gameStarted) {
-            gameState.gameStarted = true;
-            gameState.currentTurn = Object.keys(gameState.players)[0];
-            gameState.players[gameState.currentTurn].isActive = true;
+        const success = gameState.addPlayer(socket.id, playerName);
+        if (!success) {
+            socket.emit('error', { message: 'Game is full or already started' });
+            return;
         }
 
         // Broadcast updated game state
-        io.emit('game-state-update', gameState);
+        io.emit('game-state-update', {
+            players: gameState.players,
+            currentTurn: gameState.currentTurn,
+            gameStatus: gameState.gameStatus
+        });
+        
         socket.emit('player-initialized', gameState.players[socket.id]);
     });
 
     // Handle dice roll
     socket.on('roll-dice', () => {
-        if (socket.id === gameState.currentTurn) {
-            const roll = Math.floor(Math.random() * 6) + 1;
-            const player = gameState.players[socket.id];
-            const newPosition = Math.min(player.position + roll, gameState.boardSize);
-
-            // Emit dice roll event
-            io.emit('dice-rolled', {
-                playerId: socket.id,
-                roll: roll,
-                oldPosition: player.position,
-                newPosition: newPosition
-            });
-
-            // Check for question
-            if (newPosition !== gameState.boardSize) {
-                const question = getRandomQuestion();
-                gameState.questions[socket.id] = question;
-                socket.emit('show-question', {
-                    question: question,
-                    position: newPosition,
-                    isSnake: gameState.snakesAndLadders[newPosition] < newPosition,
-                    isLadder: gameState.snakesAndLadders[newPosition] > newPosition
-                });
-            } else {
-                // Player won
-                io.emit('game-won', {
-                    player: player,
-                    position: newPosition
-                });
-            }
+        if (!gameState.isValidTurn(socket.id)) {
+            socket.emit('error', { message: 'Not your turn' });
+            return;
         }
+
+        const roll = Math.floor(Math.random() * 6) + 1;
+        const player = gameState.players[socket.id];
+        const oldPosition = player.position;
+        const newPosition = Math.min(oldPosition + roll, gameState.boardSize);
+
+        // Update player position
+        const hasWon = gameState.movePlayer(socket.id, newPosition);
+
+        // Emit dice roll event
+        io.emit('dice-rolled', {
+            playerId: socket.id,
+            roll: roll,
+            oldPosition: oldPosition,
+            newPosition: gameState.players[socket.id].position
+        });
+
+        if (hasWon) {
+            io.emit('game-won', {
+                player: player,
+                finalPosition: gameState.players[socket.id].position
+            });
+            return;
+        }
+
+        // Get random question
+        const randomQuestion = questions[Math.floor(Math.random() * questions.length)];
+        const questionData = {
+            ...randomQuestion,
+            isSnake: gameState.snakesAndLadders[newPosition] < newPosition,
+            isLadder: gameState.snakesAndLadders[newPosition] > newPosition,
+            timeLimit: gameState.questionTimeout
+        };
+        
+        gameState.setQuestion(socket.id, questionData);
+
+        // Send question to player
+        socket.emit('show-question', questionData);
     });
 
     // Handle answer submission
     socket.on('submit-answer', (data) => {
+        if (!gameState.isValidTurn(socket.id)) {
+            socket.emit('error', { message: 'Not your turn' });
+            return;
+        }
+
+        if (gameState.hasQuestionTimedOut(socket.id)) {
+            socket.emit('error', { message: 'Question time limit exceeded' });
+            gameState.nextTurn();
+            io.emit('game-state-update', {
+                players: gameState.players,
+                currentTurn: gameState.currentTurn,
+                gameStatus: gameState.gameStatus
+            });
+            return;
+        }
+
         const player = gameState.players[socket.id];
         const question = gameState.questions[socket.id];
+        
+        if (!question) {
+            socket.emit('error', { message: 'No active question' });
+            return;
+        }
+
         const isCorrect = validateAnswer(data.answer, question);
         
         if (isCorrect) {
-            // Handle correct answer
+            // Award points
+            gameState.updateScore(socket.id, question.points || 10);
+            
+            // Handle ladder movement
             if (data.isLadder) {
-                player.position = gameState.snakesAndLadders[data.position];
-            } else {
-                player.position = data.position;
+                gameState.movePlayer(socket.id, gameState.snakesAndLadders[data.position]);
             }
         } else if (data.isSnake) {
             // Snake penalty for wrong answer
-            player.position = gameState.snakesAndLadders[data.position];
+            gameState.movePlayer(socket.id, gameState.snakesAndLadders[data.position]);
         }
 
         // Move to next player
-        nextTurn();
-        io.emit('game-state-update', gameState);
+        gameState.nextTurn();
+        
+        // Broadcast updated state
+        io.emit('game-state-update', {
+            players: gameState.players,
+            currentTurn: gameState.currentTurn,
+            gameStatus: gameState.gameStatus
+        });
+
+        // Send answer result to player
+        socket.emit('answer-result', {
+            correct: isCorrect,
+            points: isCorrect ? (question.points || 10) : 0,
+            newPosition: gameState.players[socket.id].position
+        });
     });
 
     // Handle skip turn
     socket.on('skip-turn', () => {
-        if (socket.id === gameState.currentTurn) {
-            nextTurn();
-            io.emit('game-state-update', gameState);
+        if (!gameState.isValidTurn(socket.id)) {
+            socket.emit('error', { message: 'Not your turn' });
+            return;
         }
+
+        gameState.nextTurn();
+        io.emit('game-state-update', {
+            players: gameState.players,
+            currentTurn: gameState.currentTurn,
+            gameStatus: gameState.gameStatus
+        });
     });
 
     // Handle disconnection
     socket.on('disconnect', () => {
         if (gameState.players[socket.id]) {
             delete gameState.players[socket.id];
+            
             if (gameState.currentTurn === socket.id) {
-                nextTurn();
+                gameState.nextTurn();
             }
-            io.emit('game-state-update', gameState);
+
+            // If not enough players, end game
+            if (Object.keys(gameState.players).length < 2) {
+                gameState.gameStatus = 'waiting';
+                gameState.gameStarted = false;
+            }
+
+            io.emit('game-state-update', {
+                players: gameState.players,
+                currentTurn: gameState.currentTurn,
+                gameStatus: gameState.gameStatus
+            });
         }
     });
 });
 
-// Helper functions
-function getNextColor(index) {
-    const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4'];
-    return colors[index % colors.length];
-}
-
-function nextTurn() {
-    const playerIds = Object.keys(gameState.players);
-    if (playerIds.length === 0) return;
-
-    const currentIndex = playerIds.indexOf(gameState.currentTurn);
-    gameState.players[gameState.currentTurn].isActive = false;
-    
-    const nextIndex = (currentIndex + 1) % playerIds.length;
-    gameState.currentTurn = playerIds[nextIndex];
-    gameState.players[gameState.currentTurn].isActive = true;
-}
-
 function validateAnswer(answer, question) {
-    // Implement answer validation logic
-    return true; // Temporary
+    if (!answer || !question || !question.solutions || !answer.language) {
+        return false;
+    }
+    
+    try {
+        const solution = question.solutions[answer.language];
+        if (!solution) return false;
+
+        // Remove whitespace and comments for comparison
+        const normalizedAnswer = answer.code.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        const normalizedSolution = solution.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+            
+        return normalizedAnswer === normalizedSolution;
+    } catch (error) {
+        console.error('Error validating answer:', error);
+        return false;
+    }
 }
 
 // Start server
