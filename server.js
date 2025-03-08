@@ -12,6 +12,15 @@ app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/socket.io', express.static(path.join(__dirname, 'node_modules/socket.io/client-dist')));
 
+// Serve game.js and questions.js from root directory
+app.get('/game.js', (req, res) => {
+    res.sendFile(path.join(__dirname, 'game.js'));
+});
+
+app.get('/questions.js', (req, res) => {
+    res.sendFile(path.join(__dirname, 'questions.js'));
+});
+
 // Initialize game state
 const gameState = new GameState();
 
